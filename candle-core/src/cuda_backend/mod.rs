@@ -10,18 +10,22 @@ use cudarc::driver::{
     CudaSlice, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
 };
 use half::{bf16, f16};
+use std::mem::ManuallyDrop;
 
 #[cfg(feature = "cudnn")]
 pub mod cudnn;
 mod device;
 mod error;
+pub mod graph_capture;
 mod utils;
 pub use device::{CudaDevice, DeviceId};
 pub use error::{CudaError, WrapErr};
+pub use graph_capture::MaybePersistent;
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 
 pub enum SlicePtrOrNull<T> {
     Ptr(CudaSlice<T>),
+    PersistentPtr(ManuallyDrop<CudaSlice<T>>),
     Null,
 }
 
@@ -29,6 +33,7 @@ impl<T: DeviceRepr> SlicePtrOrNull<T> {
     pub fn builder_arg<'a, 'b: 'a>(&'b self, builder: &mut cudarc::driver::LaunchArgs<'a>) {
         match self {
             SlicePtrOrNull::Ptr(slice) => builder.arg(slice),
+            SlicePtrOrNull::PersistentPtr(slice) => builder.arg(&**slice),
             SlicePtrOrNull::Null => builder.arg(&0usize),
         };
     }
@@ -57,7 +62,14 @@ impl SlicePtrOrNull<usize> {
         let ds = if l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[l.dims(), l.stride()].concat())?)
+            let data = [l.dims(), l.stride()].concat();
+            let slice = dev.clone_htod(&data)?;
+            if graph_capture::is_graph_capturing() {
+                graph_capture::leak_host_data(data);
+                SlicePtrOrNull::PersistentPtr(ManuallyDrop::new(slice))
+            } else {
+                SlicePtrOrNull::Ptr(slice)
+            }
         };
         Ok(ds)
     }
@@ -187,7 +199,8 @@ impl Map1 for Im2Col1D {
         let l_out = self.l_out(dims[2]);
         let threads = dims[0] * l_out * dims[1];
         let cfg = LaunchConfig::for_num_elems(threads as u32);
-        let ds = dev.clone_htod(&[dims, layout.stride()].concat())?;
+        let data = [dims, layout.stride()].concat();
+        let ds = MaybePersistent::new(dev.clone_htod(&data)?, data);
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("im2col1d"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
@@ -199,7 +212,7 @@ impl Map1 for Im2Col1D {
         barg!(builder, self.stride);
         barg!(builder, self.padding);
         barg!(builder, self.dilation);
-        builder.arg(&ds);
+        builder.arg(&*ds);
         builder.arg(src);
         builder.arg(&dst);
         // SAFETY: ffi.
@@ -238,7 +251,8 @@ impl Map1 for Im2Col {
         let (h_out, w_out) = self.hw_out(dims[2], dims[3]);
         let dst_el = dims[0] * h_out * w_out * dims[1] * self.h_k * self.w_k;
         let cfg = LaunchConfig::for_num_elems(dst_el as u32);
-        let ds = dev.clone_htod(&[dims, layout.stride()].concat())?;
+        let data = [dims, layout.stride()].concat();
+        let ds = MaybePersistent::new(dev.clone_htod(&data)?, data);
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("im2col"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
@@ -252,7 +266,7 @@ impl Map1 for Im2Col {
         barg!(builder, self.stride);
         barg!(builder, self.padding);
         barg!(builder, self.dilation);
-        builder.arg(&ds);
+        builder.arg(&*ds);
         builder.arg(src);
         builder.arg(&dst);
         // SAFETY: ffi.
@@ -330,7 +344,8 @@ impl Map1Any for FastReduce<'_> {
             block_dim: (block_dim as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        let ds = dev.clone_htod(&[dims.as_slice(), stride.as_slice()].concat())?;
+        let data = [dims.as_slice(), stride.as_slice()].concat();
+        let ds = MaybePersistent::new(dev.clone_htod(&data)?, data);
         let src = &src.slice(layout.start_offset()..);
         let (name, check_empty, return_index) = match self.1 {
             ReduceOp::Sum => ("fast_sum", false, false),
@@ -350,7 +365,7 @@ impl Map1Any for FastReduce<'_> {
             barg!(builder, src_el);
             barg!(builder, el_to_sum_per_block);
             barg!(builder, src_dims.len());
-            builder.arg(&ds);
+            builder.arg(&*ds);
             builder.arg(src);
             builder.arg(&out);
             // SAFETY: ffi.
@@ -363,7 +378,7 @@ impl Map1Any for FastReduce<'_> {
             barg!(builder, src_el);
             barg!(builder, el_to_sum_per_block);
             barg!(builder, src_dims.len());
-            builder.arg(&ds);
+            builder.arg(&*ds);
             builder.arg(src);
             builder.arg(&out);
             // SAFETY: ffi.
@@ -429,7 +444,8 @@ impl Map1 for IndexSelect<'_> {
         };
         let ids_shape = ids_l.shape();
         let ids_dims = ids_shape.dims();
-        let ds = dev.clone_htod(&[ids_dims, ids_l.stride()].concat())?;
+        let data = [ids_dims, ids_l.stride()].concat();
+        let ds = MaybePersistent::new(dev.clone_htod(&data)?, data);
         let src = match src_l.contiguous_offsets() {
             Some((o1, o2)) => src.slice(o1..o2),
             None => Err(crate::Error::RequiresContiguous { op: "index-select" }.bt())?,
@@ -446,7 +462,7 @@ impl Map1 for IndexSelect<'_> {
         let mut builder = func.builder();
         barg!(builder, dst_el);
         barg!(builder, ids_dims.len());
-        builder.arg(&ds);
+        builder.arg(&*ds);
         barg!(builder, ids);
         builder.arg(&src);
         builder.arg(&out);
@@ -695,17 +711,17 @@ impl Map2 for Conv1D<'_> {
         let func = dev.get_or_load_func(&kernel_name::<T>("conv1d"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = if dims.len() == 3 {
+        let data = if dims.len() == 3 {
             [dims, inp_l.stride(), k_l.dims(), k_l.stride()].concat()
         } else if dims.len() == 2 {
             [&[1], dims, &[1], inp_l.stride(), k_l.dims(), k_l.stride()].concat()
         } else {
             crate::bail!("unexpected input shape for conv1d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = MaybePersistent::new(dev.clone_htod(&data)?, data);
         let mut builder = func.builder();
         barg!(builder, el, l_out, p.stride, p.padding, p.dilation);
-        builder.arg(&ds);
+        builder.arg(&*ds);
         builder.arg(inp);
         builder.arg(k);
         builder.arg(&out);
@@ -740,15 +756,15 @@ impl Map2 for Conv2D<'_> {
         let out = unsafe { dev.alloc::<T>(dst_el)? };
         let cfg = LaunchConfig::for_num_elems(dst_el as u32);
         let func = dev.get_or_load_func(&kernel_name::<T>("conv2d"), &kernels::CONV)?;
-        let ds = if dims.len() == 4 {
+        let data = if dims.len() == 4 {
             [dims, inp_l.stride(), k_l.dims(), k_l.stride()].concat()
         } else {
             crate::bail!("unexpected input shape for conv2d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = MaybePersistent::new(dev.clone_htod(&data)?, data);
         let mut builder = func.builder();
         barg!(builder, el, out_w, out_h, p.stride, p.padding, p.dilation);
-        builder.arg(&ds);
+        builder.arg(&*ds);
         builder.arg(inp);
         builder.arg(k);
         builder.arg(&out);
@@ -811,12 +827,12 @@ impl Map2 for ConvTranspose1D<'_> {
         let out = unsafe { dev.alloc::<T>(dst_el)? };
         let cfg = LaunchConfig::for_num_elems(dst_el as u32);
         let func = dev.get_or_load_func(&kernel_name::<T>("conv_transpose1d"), &kernels::CONV)?;
-        let ds = if dims.len() == 3 {
+        let data = if dims.len() == 3 {
             [dims, inp_l.stride(), k_l.dims(), k_l.stride()].concat()
         } else {
             crate::bail!("unexpected input shape for conv_transpose1d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = MaybePersistent::new(dev.clone_htod(&data)?, data);
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, l_out);
@@ -824,7 +840,7 @@ impl Map2 for ConvTranspose1D<'_> {
         barg!(builder, p.padding);
         barg!(builder, p.output_padding);
         barg!(builder, p.dilation);
-        builder.arg(&ds);
+        builder.arg(&*ds);
         builder.arg(inp);
         builder.arg(k);
         builder.arg(&out);
@@ -859,12 +875,12 @@ impl Map2 for ConvTranspose2D<'_> {
         let out = unsafe { dev.alloc::<T>(dst_el)? };
         let cfg = LaunchConfig::for_num_elems(dst_el as u32);
         let func = dev.get_or_load_func(&kernel_name::<T>("conv_transpose2d"), &kernels::CONV)?;
-        let ds = if dims.len() == 4 {
+        let data = if dims.len() == 4 {
             [dims, inp_l.stride(), k_l.dims(), k_l.stride()].concat()
         } else {
             crate::bail!("unexpected input shape for conv_transpose2d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = MaybePersistent::new(dev.clone_htod(&data)?, data);
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, out_w);
@@ -873,7 +889,7 @@ impl Map2 for ConvTranspose2D<'_> {
         barg!(builder, p.padding);
         barg!(builder, p.output_padding);
         barg!(builder, p.dilation);
-        builder.arg(&ds);
+        builder.arg(&*ds);
         builder.arg(inp);
         builder.arg(k);
         builder.arg(&out);
@@ -907,7 +923,7 @@ impl Map1 for Pool2D {
         let inp = &inp.slice(inp_l.start_offset()..);
         let shape = inp_l.shape();
         let dims = shape.dims();
-        let ds = if dims.len() == 4 {
+        let ds_data = if dims.len() == 4 {
             [dims, inp_l.stride()].concat()
         } else {
             crate::bail!("unexpected input shape for pool {dims:?}")
@@ -924,14 +940,14 @@ impl Map1 for Pool2D {
         let func = dev.get_or_load_func(&kernel_name::<T>(kname), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = MaybePersistent::new(dev.clone_htod(&ds_data)?, ds_data);
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, self.w_k);
         barg!(builder, self.h_k);
         barg!(builder, self.w_stride);
         barg!(builder, self.h_stride);
-        builder.arg(&ds);
+        builder.arg(&*ds);
         builder.arg(inp);
         builder.arg(&out);
         // SAFETY: ffi.
@@ -952,7 +968,7 @@ impl Map1 for UpsampleNearest2D {
         let inp = &inp.slice(inp_l.start_offset()..);
         let shape = inp_l.shape();
         let dims = shape.dims();
-        let ds = if dims.len() == 4 {
+        let ds_data = if dims.len() == 4 {
             [dims, inp_l.stride()].concat()
         } else {
             crate::bail!("unexpected input shape for upsample {dims:?}")
@@ -963,7 +979,7 @@ impl Map1 for UpsampleNearest2D {
         let func = dev.get_or_load_func(&kernel_name::<T>("upsample_nearest2d"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = MaybePersistent::new(dev.clone_htod(&ds_data)?, ds_data);
         let scale_w = dims[2] as f64 / out_w as f64;
         let scale_h = dims[3] as f64 / out_h as f64;
         let mut builder = func.builder();
@@ -971,7 +987,7 @@ impl Map1 for UpsampleNearest2D {
         barg!(builder, out_h);
         barg!(builder, scale_w);
         barg!(builder, scale_h);
-        builder.arg(&ds);
+        builder.arg(&*ds);
         builder.arg(inp);
         builder.arg(&out);
         // SAFETY: ffi.
@@ -998,7 +1014,7 @@ impl Map1 for UpsampleBilinear2D {
         let inp = &inp.slice(inp_l.start_offset()..);
         let shape = inp_l.shape();
         let dims = shape.dims();
-        let ds = if dims.len() == 4 {
+        let ds_data = if dims.len() == 4 {
             [dims, inp_l.stride()].concat()
         } else {
             crate::bail!("unexpected input shape for upsample_bilinear2d {dims:?}")
@@ -1012,7 +1028,7 @@ impl Map1 for UpsampleBilinear2D {
 
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = MaybePersistent::new(dev.clone_htod(&ds_data)?, ds_data);
 
         let mut builder = func.builder();
         barg!(builder, out_w);
@@ -1022,7 +1038,7 @@ impl Map1 for UpsampleBilinear2D {
         barg!(builder, self.scale_h_factor.unwrap_or(0.0));
         barg!(builder, self.scale_w_factor.is_some());
         barg!(builder, self.scale_w_factor.unwrap_or(0.0));
-        builder.arg(&ds);
+        builder.arg(&*ds);
         builder.arg(inp);
         builder.arg(&out);
 
@@ -1067,8 +1083,8 @@ impl Map2 for WhereCond<'_> {
         let dims = shape.dims();
         let el = shape.elem_count();
         let cfg = LaunchConfig::for_num_elems(el as u32);
-        let ds =
-            dev.clone_htod(&[dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat())?;
+        let data = [dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat();
+        let ds = MaybePersistent::new(dev.clone_htod(&data)?, data);
         let t = &t.slice(layout_t.start_offset()..);
         let f = &f.slice(layout_f.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::TERNARY)?;
@@ -1077,7 +1093,7 @@ impl Map2 for WhereCond<'_> {
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, dims.len());
-        builder.arg(&ds);
+        builder.arg(&*ds);
         barg!(builder, ids);
         builder.arg(t);
         builder.arg(f);
@@ -1104,7 +1120,14 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
         let dims_and_strides = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+            let data = [dims, lhs_l.stride(), rhs_l.stride()].concat();
+            let slice = dev.clone_htod(&data)?;
+            if graph_capture::is_graph_capturing() {
+                graph_capture::leak_host_data(data);
+                SlicePtrOrNull::PersistentPtr(ManuallyDrop::new(slice))
+            } else {
+                SlicePtrOrNull::Ptr(slice)
+            }
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
@@ -1141,7 +1164,14 @@ impl Map2Any for Cmp {
         let dims_and_strides = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+            let data = [dims, lhs_l.stride(), rhs_l.stride()].concat();
+            let slice = dev.clone_htod(&data)?;
+            if graph_capture::is_graph_capturing() {
+                graph_capture::leak_host_data(data);
+                SlicePtrOrNull::PersistentPtr(ManuallyDrop::new(slice))
+            } else {
+                SlicePtrOrNull::Ptr(slice)
+            }
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
@@ -2528,8 +2558,20 @@ unsafe fn gemm_strided_batched_f32(
     } else {
         sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
     };
-    let alpha = &cfg.gemm.alpha as *const f32 as *const _;
-    let beta = &cfg.gemm.beta as *const f32 as *const _;
+    // During CUDA graph capture, cuBLAS records host pointer addresses for alpha/beta.
+    // Stack-local pointers become invalid after the function returns, causing
+    // CUDA_ERROR_MISALIGNED_ADDRESS on graph replay. Leak to persistent heap storage.
+    let (alpha, beta) = if graph_capture::is_graph_capturing() {
+        (
+            Box::leak(Box::new(cfg.gemm.alpha)) as *const f32 as *const _,
+            Box::leak(Box::new(cfg.gemm.beta)) as *const f32 as *const _,
+        )
+    } else {
+        (
+            &cfg.gemm.alpha as *const f32 as *const _,
+            &cfg.gemm.beta as *const f32 as *const _,
+        )
+    };
 
     let stream = c.stream().clone();
     let (a, _guard_a) = a.device_ptr(&stream);
@@ -2573,22 +2615,42 @@ unsafe fn gemm_strided_batched_f16(
     use cudarc::cublas::sys;
     use cudarc::driver::DevicePtrMut;
 
-    let alpha = cfg.gemm.alpha;
-    let beta = cfg.gemm.beta;
+    let alpha_val = cfg.gemm.alpha;
+    let beta_val = cfg.gemm.beta;
     let alpha_f32: f32 = cfg.gemm.alpha.to_f32();
     let beta_f32: f32 = cfg.gemm.beta.to_f32();
+    // During CUDA graph capture, cuBLAS records host pointer addresses for alpha/beta.
+    // Stack-local pointers become invalid after the function returns, causing
+    // CUDA_ERROR_MISALIGNED_ADDRESS on graph replay. Leak to persistent heap storage.
+    let capturing = graph_capture::is_graph_capturing();
     let (compute_type, alpha, beta) = if gemm_reduced_precision_f16() {
-        (
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
-            (&alpha) as *const f16 as *const _,
-            (&beta) as *const f16 as *const _,
-        )
+        if capturing {
+            (
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
+                Box::leak(Box::new(alpha_val)) as *const f16 as *const _,
+                Box::leak(Box::new(beta_val)) as *const f16 as *const _,
+            )
+        } else {
+            (
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
+                (&alpha_val) as *const f16 as *const _,
+                (&beta_val) as *const f16 as *const _,
+            )
+        }
     } else {
-        (
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            (&alpha_f32) as *const f32 as *const _,
-            (&beta_f32) as *const f32 as *const _,
-        )
+        if capturing {
+            (
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                Box::leak(Box::new(alpha_f32)) as *const f32 as *const _,
+                Box::leak(Box::new(beta_f32)) as *const f32 as *const _,
+            )
+        } else {
+            (
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                (&alpha_f32) as *const f32 as *const _,
+                (&beta_f32) as *const f32 as *const _,
+            )
+        }
     };
 
     let stream = c.stream().clone();
@@ -2636,18 +2698,37 @@ unsafe fn gemm_strided_batched_bf16(
     let beta_f32: f32 = cfg.gemm.beta.to_f32();
     // The type for alpha and beta depends on the computeType.
     // https://docs.nvidia.com/cuda/cublas/index.html#cublasgemmstridedbatchedex
+    // During CUDA graph capture, cuBLAS records host pointer addresses for alpha/beta.
+    // Stack-local pointers become invalid after the function returns, causing
+    // CUDA_ERROR_MISALIGNED_ADDRESS on graph replay. Leak to persistent heap storage.
     let (compute_type, alpha, beta) = if gemm_reduced_precision_bf16() {
-        (
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
-            (&alpha_f32) as *const f32 as *const _,
-            (&beta_f32) as *const f32 as *const _,
-        )
+        if graph_capture::is_graph_capturing() {
+            (
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
+                Box::leak(Box::new(alpha_f32)) as *const f32 as *const _,
+                Box::leak(Box::new(beta_f32)) as *const f32 as *const _,
+            )
+        } else {
+            (
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
+                (&alpha_f32) as *const f32 as *const _,
+                (&beta_f32) as *const f32 as *const _,
+            )
+        }
     } else {
-        (
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            (&alpha_f32) as *const f32 as *const _,
-            (&beta_f32) as *const f32 as *const _,
-        )
+        if graph_capture::is_graph_capturing() {
+            (
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                Box::leak(Box::new(alpha_f32)) as *const f32 as *const _,
+                Box::leak(Box::new(beta_f32)) as *const f32 as *const _,
+            )
+        } else {
+            (
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                (&alpha_f32) as *const f32 as *const _,
+                (&beta_f32) as *const f32 as *const _,
+            )
+        }
     };
 
     let stream = c.stream().clone();
