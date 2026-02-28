@@ -10,6 +10,11 @@
 //! This module prevents both deallocations:
 //! - GPU buffer: wrapped in `ManuallyDrop` (prevents cudaFreeAsync)
 //! - Host Vec: leaked via `std::mem::forget` (prevents heap deallocation)
+//!
+//! Note: intermediate tensor address reuse (the main source of graph replay
+//! corruption) is handled by a dedicated capture memory pool in mistral.rs's
+//! `cuda_graph::switch_to_capture_pool()` / `restore_default_pool()`, NOT by
+//! tensor retention. This module only handles stride buffer persistence.
 
 use cudarc::driver::CudaSlice;
 use std::cell::Cell;
