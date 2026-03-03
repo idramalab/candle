@@ -48,6 +48,8 @@ extern "C" {
         window_size_right: c_int,
 
         softcap: f32,
+
+        stream: i64, // cudaStream_t (pointer, passed as i64)
     );
 
 }
