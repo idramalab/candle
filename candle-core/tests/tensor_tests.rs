@@ -2060,3 +2060,108 @@ fn allocates_twice_when_transferring_to_same_device() -> Result<()> {
     assert_ne!(id1, id2);
     Ok(())
 }
+
+/// Test that the stride buffer cache produces correct results for non-contiguous tensor ops.
+/// params_from_layout caches (dims, strides) -> GPU buffer. Repeated ops with the same layout
+/// should hit the cache and produce identical numerical results.
+#[cfg(feature = "cuda")]
+#[test]
+fn stride_cache_correctness() -> Result<()> {
+    let dev = Device::new_cuda(0)?;
+
+    // Create a non-contiguous tensor via transpose (triggers params_from_layout)
+    let t = Tensor::new(&[[1f32, 2., 3.], [4., 5., 6.]], &dev)?;
+    let t_transposed = t.t()?;
+    assert!(!t_transposed.is_contiguous());
+
+    // First op on non-contiguous tensor: cache miss, populates cache
+    let r1 = (&t_transposed + 1.0)?.to_vec2::<f32>()?;
+    assert_eq!(r1, [[2.0, 5.0], [3.0, 6.0], [4.0, 7.0]]);
+
+    // Second op with same layout: cache hit, must produce same results
+    let r2 = (&t_transposed + 1.0)?.to_vec2::<f32>()?;
+    assert_eq!(r1, r2);
+
+    // Different non-contiguous layout (different shape/strides)
+    let t2 = Tensor::new(&[[[1f32, 2.], [3., 4.]], [[5., 6.], [7., 8.]]], &dev)?;
+    let t2_transposed = t2.transpose(0, 2)?;
+    assert!(!t2_transposed.is_contiguous());
+
+    let r3 = (&t2_transposed * 2.0)?.to_vec3::<f32>()?;
+    assert_eq!(r3, [[[2.0, 10.0], [6.0, 14.0]], [[4.0, 12.0], [8.0, 16.0]]]);
+
+    // Repeat with same 3D layout: cache hit
+    let r4 = (&t2_transposed * 2.0)?.to_vec3::<f32>()?;
+    assert_eq!(r3, r4);
+
+    Ok(())
+}
+
+/// Test that the stride cache is populated and reused (observable via cache_len).
+#[cfg(feature = "cuda")]
+#[test]
+fn stride_cache_reuse() -> Result<()> {
+    let dev = Device::new_cuda(0)?;
+    let cuda_dev = dev.as_cuda_device().unwrap();
+
+    let initial_cache_len = cuda_dev.stride_cache_len();
+
+    // Create a non-contiguous tensor and perform an op (populates cache)
+    let t = Tensor::new(&[[1f32, 2., 3.], [4., 5., 6.]], &dev)?;
+    let t_nc = t.t()?;
+    let _r1 = (&t_nc + 0.0)?;
+
+    let after_first = cuda_dev.stride_cache_len();
+    assert!(
+        after_first > initial_cache_len,
+        "Cache should grow after first non-contiguous op: {} vs {}",
+        after_first,
+        initial_cache_len
+    );
+
+    // Same layout again — cache should NOT grow
+    let _r2 = (&t_nc * 1.0)?;
+    let after_second = cuda_dev.stride_cache_len();
+    assert_eq!(
+        after_first, after_second,
+        "Cache should not grow for repeated layout"
+    );
+
+    // Different layout — cache should grow
+    let t2 = Tensor::new(&[[1f32, 2.], [3., 4.], [5., 6.]], &dev)?;
+    let t2_nc = t2.t()?;
+    let _r3 = (&t2_nc + 0.0)?;
+    let after_third = cuda_dev.stride_cache_len();
+    assert!(
+        after_third > after_second,
+        "Cache should grow for new layout: {} vs {}",
+        after_third,
+        after_second
+    );
+
+    Ok(())
+}
+
+/// Test that contiguous tensor ops do NOT populate the stride cache.
+#[cfg(feature = "cuda")]
+#[test]
+fn stride_cache_contiguous_skip() -> Result<()> {
+    let dev = Device::new_cuda(0)?;
+    let cuda_dev = dev.as_cuda_device().unwrap();
+
+    let before = cuda_dev.stride_cache_len();
+
+    // Contiguous ops should use SlicePtrOrNull::Null, not touch the cache
+    let t = Tensor::new(&[[1f32, 2.], [3., 4.]], &dev)?;
+    let _r = (&t + 1.0)?;
+    let _r = (&t * 2.0)?;
+    let _r = t.exp()?;
+
+    let after = cuda_dev.stride_cache_len();
+    assert_eq!(
+        before, after,
+        "Contiguous ops should not populate stride cache"
+    );
+
+    Ok(())
+}

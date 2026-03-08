@@ -2,10 +2,11 @@ use crate::backend::{BackendDevice, BackendStorage};
 use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
 pub use candle_kernels as kernels;
 pub use cudarc;
-use cudarc::driver::CudaFunction;
+use cudarc::driver::{CudaFunction, CudaSlice};
 use float8::F8E4M3;
 use half::{bf16, f16};
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
@@ -40,6 +41,11 @@ pub struct CudaDevice {
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
+    /// Cache for stride/dims GPU buffers to avoid repeated H2D copies in params_from_layout.
+    /// Key = concatenated [dims, strides] vector. Value = GPU buffer (ManuallyDrop to prevent
+    /// dealloc). There are only ~20-30 unique layouts in typical LLM inference, each ~48 bytes,
+    /// so the total GPU memory overhead is negligible (<2KB).
+    stride_cache: Arc<Mutex<HashMap<Vec<usize>, ManuallyDrop<CudaSlice<usize>>>>>,
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -112,6 +118,38 @@ impl CudaDevice {
         src: &Src,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
         self.stream.clone_htod(src).w()
+    }
+
+    /// Look up a cached stride/dims GPU buffer. Returns a non-owning bitwise copy if found.
+    ///
+    /// # Safety
+    /// The returned `ManuallyDrop<CudaSlice<usize>>` is a bitwise copy of the cached entry.
+    /// It is safe because:
+    /// 1. Both the original and the copy are `ManuallyDrop` — neither will be dropped/freed.
+    /// 2. The cache (and thus the original) lives as long as the `CudaDevice` (Arc-owned).
+    /// 3. `CudaSlice` fields are all bitwise-copyable (u64 ptr, usize len, Option<CudaEvent>,
+    ///    Arc<CudaStream>, PhantomData) — the Arc refcount is NOT incremented, but since neither
+    ///    copy is ever dropped (ManuallyDrop), the refcount stays balanced.
+    pub fn get_cached_stride_buffer(
+        &self,
+        key: &[usize],
+    ) -> Option<ManuallyDrop<CudaSlice<usize>>> {
+        let cache = self.stride_cache.lock().unwrap();
+        cache.get(key).map(|entry| {
+            // SAFETY: see doc comment above.
+            unsafe { std::ptr::read(entry) }
+        })
+    }
+
+    /// Store a stride/dims GPU buffer in the cache. The buffer will never be freed.
+    pub fn cache_stride_buffer(&self, key: Vec<usize>, slice: CudaSlice<usize>) {
+        let mut cache = self.stride_cache.lock().unwrap();
+        cache.entry(key).or_insert_with(|| ManuallyDrop::new(slice));
+    }
+
+    /// Number of entries in the stride buffer cache (for testing/diagnostics).
+    pub fn stride_cache_len(&self) -> usize {
+        self.stride_cache.lock().unwrap().len()
     }
 }
 
@@ -267,6 +305,7 @@ impl CudaDevice {
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
+            stride_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -291,6 +330,7 @@ impl BackendDevice for CudaDevice {
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
+            stride_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
