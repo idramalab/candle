@@ -64,27 +64,27 @@ impl SlicePtrOrNull<usize> {
         } else {
             let data = [l.dims(), l.stride()].concat();
 
-            // Check the per-device stride cache first. Cache hit = zero alloc, zero H2D copy.
-            // All entries are PersistentPtr (ManuallyDrop) — the GPU buffer is owned by the
-            // cache and lives as long as the CudaDevice. Only ~20-30 unique layouts exist in
-            // typical LLM inference so the total GPU overhead is <2KB.
-            let cached = if let Some(hit) = dev.get_cached_stride_buffer(&data) {
-                hit
+            // During graph capture, skip the cache: allocations go to the capture pool
+            // which has different lifetime semantics. Caching capture-pool pointers would
+            // create dangling references after capture ends. The cache is most valuable
+            // during prefill (100K+ calls); capture only does ~5K calls total.
+            if graph_capture::is_graph_capturing() {
+                let slice = dev.clone_htod(&data)?;
+                graph_capture::leak_host_data(data);
+                SlicePtrOrNull::PersistentPtr(ManuallyDrop::new(slice))
+            } else if let Some(hit) = dev.get_cached_stride_buffer(&data) {
+                // Cache hit: zero alloc, zero H2D copy. All entries are PersistentPtr
+                // (ManuallyDrop) — the GPU buffer is owned by the cache and lives as long
+                // as the CudaDevice. Only ~20-30 unique layouts exist in typical LLM
+                // inference so the total GPU overhead is <2KB.
+                SlicePtrOrNull::PersistentPtr(hit)
             } else {
                 // Cache miss: alloc + H2D, then insert into the cache for future reuse.
                 let slice = dev.clone_htod(&data)?;
-                if graph_capture::is_graph_capturing() {
-                    // Leak the host Vec so the graph's memcpy node can re-read it on replay.
-                    graph_capture::leak_host_data(data.clone());
-                }
-                // Insert into cache; cache_stride_buffer takes ownership of the key Vec and
-                // the slice. or_insert_with ensures idempotency if two threads race here.
                 dev.cache_stride_buffer(data.clone(), slice);
                 // Retrieve the persistent alias we just stored.
-                // unwrap: we inserted it above so it is guaranteed present.
-                dev.get_cached_stride_buffer(&data).unwrap()
-            };
-            SlicePtrOrNull::PersistentPtr(cached)
+                SlicePtrOrNull::PersistentPtr(dev.get_cached_stride_buffer(&data).unwrap())
+            }
         };
         Ok(ds)
     }
