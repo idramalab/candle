@@ -47,7 +47,7 @@ candle-transformers = { path = "./candle-transformers", version = "0.9.2" }
 candle-ug = { path = "./candle-ug", version = "0.9.2" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false }
-cudarc = { git = "https://github.com/idramalab/cudarc.git", rev = "f3120a7", version = "0.19.2", features = [
+cudarc = { git = "https://github.com/idramalab/cudarc.git", rev = "a987d8c", version = "0.19.2", features = [
     "std",
     "cublas",
     "cublaslt",
